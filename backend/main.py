@@ -2,8 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
+from passlib.context import CryptContext
 from google import genai
+from datetime import datetime, timezone
 import os
 
 
@@ -114,6 +116,14 @@ async def database_test():
             "message": "MongoDB connection failed",
             "details": str(e)
         }
+# ============================================================
+# PASSWORD HASHING
+# ============================================================
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto"
+)
 
 
 # ============================================================
@@ -127,17 +137,29 @@ class DisasterRequest(BaseModel):
     description: str
     severity: int
 
+# ============================================================
+# USER AUTHENTICATION MODEL
+# ============================================================
+
+class UserSignup(BaseModel):
+    email: EmailStr
+    password: str
+    organization: str
+
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
 
 # ============================================================
 # AI DISASTER ANALYSIS ENDPOINT
 # ============================================================
 
+
+
+
 @app.post("/api/analyze-disaster")
 async def analyze_disaster(request: DisasterRequest):
-
-    # --------------------------------------------------------
-    # Create prompt for Gemini
-    # --------------------------------------------------------
 
     prompt = f"""
 You are ResQ-AI, an AI-powered disaster management
@@ -160,7 +182,6 @@ Description:
 
 Severity:
 {request.severity}/10
-
 
 Provide a structured emergency assessment.
 
@@ -219,26 +240,192 @@ or emergency-service availability that was not provided
 in the input.
 """
 
+    try:
+        # ------------------------------------------------
+        # 1. Ask Gemini to analyze the disaster
+        # ------------------------------------------------
 
-    # --------------------------------------------------------
-    # Send request to Gemini
-    # --------------------------------------------------------
+        response = gemini_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt
+        )
 
-    response = gemini_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=prompt
-    )
+        analysis = response.text
 
+        # ------------------------------------------------
+        # 2. Create incident document
+        # ------------------------------------------------
 
-    # --------------------------------------------------------
-    # Return AI response
-    # --------------------------------------------------------
+        incident = {
+            "disaster_type": request.disaster_type,
+            "location": request.location,
+            "description": request.description,
+            "severity": request.severity,
+            "ai_analysis": analysis,
+            "created_at": datetime.now(timezone.utc)
+        }
 
-    return {
-        "status": "success",
-        "disaster_type": request.disaster_type,
-        "location": request.location,
-        "severity": request.severity,
-        "analysis": response.text
-    }
-    
+        # ------------------------------------------------
+        # 3. Save incident to MongoDB
+        # ------------------------------------------------
+
+        result = await database.incidents.insert_one(incident)
+
+        # ------------------------------------------------
+        # 4. Return result
+        # ------------------------------------------------
+
+        return {
+            "status": "success",
+            "message": "Disaster analyzed and incident saved successfully.",
+            "incident_id": str(result.inserted_id),
+            "disaster_type": request.disaster_type,
+            "location": request.location,
+            "severity": request.severity,
+            "analysis": analysis
+        }
+
+    except Exception as e:
+
+        print("ERROR:", str(e))
+
+        return {
+            "status": "error",
+            "message": "Failed to analyze or save disaster.",
+            "details": str(e)
+        }
+
+# ============================================================
+# GET ALL SAVED INCIDENTS
+# ============================================================
+
+@app.get("/api/incidents")
+async def get_incidents():
+
+    try:
+        incidents = []
+
+        cursor = database.incidents.find().sort("created_at", -1)
+
+        async for incident in cursor:
+            incident["_id"] = str(incident["_id"])
+
+            incidents.append(incident)
+
+        return {
+            "status": "success",
+            "count": len(incidents),
+            "incidents": incidents
+        }
+
+    except Exception as e:
+
+        print("ERROR:", str(e))
+
+        return {
+            "status": "error",
+            "message": "Failed to fetch incidents.",
+            "details": str(e)
+        }
+
+# ============================================================
+# USER SIGN UP
+# ============================================================
+
+@app.post("/api/auth/signup")
+async def signup(user: UserSignup):
+
+    try:
+        # Check whether the email already exists
+        existing_user = await database.users.find_one({
+            "email": user.email
+        })
+
+        if existing_user:
+            return {
+                "status": "error",
+                "message": "An account with this email already exists."
+            }
+
+        # Hash the password before storing it
+        hashed_password = pwd_context.hash(user.password)
+
+        # Create user document
+        new_user = {
+            "email": user.email,
+            "password": hashed_password,
+            "organization": user.organization,
+            "created_at": datetime.now(timezone.utc)
+        }
+
+        # Save user to MongoDB
+        result = await database.users.insert_one(new_user)
+
+        return {
+            "status": "success",
+            "message": "Account created successfully.",
+            "user_id": str(result.inserted_id),
+            "email": user.email,
+            "organization": user.organization
+        }
+
+    except Exception as e:
+
+        print("SIGNUP ERROR:", str(e))
+
+        return {
+            "status": "error",
+            "message": "Failed to create account.",
+            "details": str(e)
+        }
+# ============================================================
+# USER LOGIN
+# ============================================================
+
+@app.post("/api/auth/login")
+async def login(user: UserLogin):
+
+    try:
+        # Find user by email
+        existing_user = await database.users.find_one({
+            "email": user.email
+        })
+
+        if not existing_user:
+            return {
+                "status": "error",
+                "message": "Invalid email or password."
+            }
+
+        # Verify password
+        password_correct = pwd_context.verify(
+            user.password,
+            existing_user["password"]
+        )
+
+        if not password_correct:
+            return {
+                "status": "error",
+                "message": "Invalid email or password."
+            }
+
+        return {
+            "status": "success",
+            "message": "Login successful.",
+            "user": {
+                "id": str(existing_user["_id"]),
+                "email": existing_user["email"],
+                "organization": existing_user["organization"]
+            }
+        }
+
+    except Exception as e:
+
+        print("LOGIN ERROR:", str(e))
+
+        return {
+            "status": "error",
+            "message": "Login failed.",
+            "details": str(e)
+        }
+        
